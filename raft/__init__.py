@@ -10,8 +10,10 @@ from .node import (
     CANDIDATE,
     FOLLOWER,
     LEADER,
+    PRE_CANDIDATE,
     NotLeaderError,
     RaftNode,
+    TransferInProgressError,
 )
 from .storage import FileStorage, MemoryStorage, Storage
 from .transport import LocalTransport, TcpTransport, Transport
@@ -19,7 +21,9 @@ from .transport import LocalTransport, TcpTransport, Transport
 __all__ = [
     "RaftNode",
     "NotLeaderError",
+    "TransferInProgressError",
     "FOLLOWER",
+    "PRE_CANDIDATE",
     "CANDIDATE",
     "LEADER",
     "Log",

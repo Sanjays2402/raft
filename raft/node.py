@@ -21,10 +21,12 @@ from .rpc import (
     append_entries_response,
     request_vote,
     request_vote_response,
+    timeout_now,
 )
 from .storage import Storage
 
 FOLLOWER = "follower"
+PRE_CANDIDATE = "pre-candidate"
 CANDIDATE = "candidate"
 LEADER = "leader"
 
@@ -36,6 +38,14 @@ class NotLeaderError(Exception):
         self.leader_id = leader_id
         hint = f" (leader is {leader_id})" if leader_id else ""
         super().__init__(f"not the leader{hint}")
+
+
+class TransferInProgressError(Exception):
+    """Raised by :meth:`RaftNode.submit` while a leadership transfer is pending."""
+
+    def __init__(self, target: str) -> None:
+        self.target = target
+        super().__init__(f"leadership transfer to {target} in progress")
 
 
 class RaftNode:
@@ -51,6 +61,7 @@ class RaftNode:
         heartbeat_interval: float = 0.050,
         clock: Optional[Callable[[], float]] = None,
         rng: Optional[random.Random] = None,
+        pre_vote: bool = True,
     ) -> None:
         self.id = node_id
         self.peers = list(peer_ids)
@@ -61,6 +72,7 @@ class RaftNode:
         self.heartbeat_interval = heartbeat_interval
         self.clock = clock or time.monotonic
         self.rng = rng or random.Random()
+        self.pre_vote = pre_vote
 
         # Persistent state (survives crashes via storage).
         term, voted_for, entries = storage.load()
@@ -76,6 +88,9 @@ class RaftNode:
         self._votes_received: set = set()
         self._next_index: Dict[str, int] = {}
         self._match_index: Dict[str, int] = {}
+        self._last_leader_contact: float = float("-inf")
+        self._transfer_target: Optional[str] = None
+        self._transfer_deadline: float = 0.0
 
         now = self.clock()
         self._election_deadline = now + self._random_timeout()
@@ -89,6 +104,8 @@ class RaftNode:
         """Advance timers. Call frequently (e.g. every 5-10 ms)."""
         now = self.clock()
         if self.state == LEADER:
+            if self._transfer_target is not None and now >= self._transfer_deadline:
+                self._transfer_target = None  # target never caught up; give up
             if now >= self._heartbeat_deadline:
                 for peer in self.peers:
                     self._replicate_to(peer)
@@ -107,7 +124,46 @@ class RaftNode:
             self._on_request_vote_response(msg)
         elif msg_type == "append_entries_response":
             self._on_append_entries_response(msg)
+        elif msg_type == "timeout_now":
+            self._on_timeout_now(msg)
         return None
+
+    def status(self) -> Dict[str, Any]:
+        """A JSON-serializable snapshot of this node, for logs and monitoring.
+
+        ``next_index`` and ``match_index`` are only populated on the leader.
+        """
+        return {
+            "id": self.id,
+            "state": self.state,
+            "term": self.current_term,
+            "leader_id": self.leader_id,
+            "peers": list(self.peers),
+            "commit_index": self.commit_index,
+            "last_applied": self.last_applied,
+            "last_log_index": self.log.last_index(),
+            "last_log_term": self.log.last_term(),
+            "pre_vote": self.pre_vote,
+            "transfer_target": self._transfer_target,
+            "next_index": dict(self._next_index) if self.state == LEADER else {},
+            "match_index": dict(self._match_index) if self.state == LEADER else {},
+        }
+
+    def transfer_leadership(self, target: str) -> None:
+        """Hand leadership to ``target``, a peer that is caught up with the log.
+
+        While the transfer is pending, :meth:`submit` raises
+        :class:`TransferInProgressError`. If the target has not caught up
+        within one election timeout, the transfer is abandoned and the leader
+        resumes normal operation.
+        """
+        if self.state != LEADER:
+            raise NotLeaderError(self.leader_id)
+        if target not in self.peers:
+            raise ValueError(f"unknown peer: {target!r}")
+        self._transfer_target = target
+        self._transfer_deadline = self.clock() + self.election_timeout[1]
+        self._maybe_send_timeout_now()
 
     def submit(self, command: Any) -> int:
         """Append a command to the log. Only valid on the leader.
@@ -117,6 +173,8 @@ class RaftNode:
         """
         if self.state != LEADER:
             raise NotLeaderError(self.leader_id)
+        if self._transfer_target is not None:
+            raise TransferInProgressError(self._transfer_target)
         entry = LogEntry(term=self.current_term, command=command)
         self.log.append(entry)
         self._persist()
@@ -141,6 +199,13 @@ class RaftNode:
     def _reset_election_deadline(self) -> None:
         self._election_deadline = self.clock() + self._random_timeout()
 
+    def _log_up_to_date(self, candidate_term: int, candidate_index: int) -> bool:
+        """Raft's election restriction: is the candidate's log at least as current?"""
+        our_term = self.log.last_term()
+        return candidate_term > our_term or (
+            candidate_term == our_term and candidate_index >= self.log.last_index()
+        )
+
     # -- state transitions -------------------------------------------
 
     def _become_follower(self, term: int) -> None:
@@ -151,9 +216,38 @@ class RaftNode:
         self.state = FOLLOWER
         self.leader_id = None
         self._votes_received.clear()
+        self._transfer_target = None
         self._reset_election_deadline()
 
     def _start_election(self) -> None:
+        """Begin an election, probing with a PreVote first when enabled."""
+        if self.pre_vote:
+            self._start_pre_vote()
+        else:
+            self._start_real_election()
+
+    def _start_pre_vote(self) -> None:
+        # PreVote leaves term and voted_for alone, so a node cut off from the
+        # cluster cannot inflate its term and depose a healthy leader later.
+        self.state = PRE_CANDIDATE
+        self.leader_id = None
+        self._votes_received = {self.id}
+        self._reset_election_deadline()
+        if len(self._votes_received) >= self._majority():
+            self._start_real_election()
+            return
+        msg = request_vote(
+            sender=self.id,
+            term=self.current_term + 1,
+            candidate_id=self.id,
+            last_log_index=self.log.last_index(),
+            last_log_term=self.log.last_term(),
+            pre_vote=True,
+        )
+        for peer in self.peers:
+            self.transport.send(peer, msg)
+
+    def _start_real_election(self) -> None:
         self.current_term += 1
         self.voted_for = self.id
         self._persist()
@@ -227,18 +321,16 @@ class RaftNode:
     # -- RPC handlers -------------------------------------------------
 
     def _on_request_vote(self, msg: Dict[str, Any]) -> Dict[str, Any]:
+        if msg.get("pre_vote"):
+            return self._on_pre_vote(msg)
         term = msg["term"]
         if term > self.current_term:
             self._become_follower(term)
         granted = False
         if term == self.current_term:
             candidate = msg["candidate_id"]
-            candidate_term = msg["last_log_term"]
-            candidate_index = msg["last_log_index"]
-            our_term = self.log.last_term()
-            log_ok = (candidate_term > our_term) or (
-                candidate_term == our_term
-                and candidate_index >= self.log.last_index()
+            log_ok = self._log_up_to_date(
+                msg["last_log_term"], msg["last_log_index"]
             )
             if (self.voted_for is None or self.voted_for == candidate) and log_ok:
                 granted = True
@@ -249,9 +341,35 @@ class RaftNode:
             sender=self.id, term=self.current_term, vote_granted=granted
         )
 
+    def _on_pre_vote(self, msg: Dict[str, Any]) -> Dict[str, Any]:
+        # Grant only if we have not heard from a leader within the minimum
+        # election timeout, so a live leader is never displaced by a PreVote.
+        # Nothing here mutates term or voted_for.
+        heard_recently = (
+            self.clock() - self._last_leader_contact < self.election_timeout[0]
+        )
+        granted = (
+            self.state != LEADER
+            and not heard_recently
+            and msg["term"] > self.current_term
+            and self._log_up_to_date(msg["last_log_term"], msg["last_log_index"])
+        )
+        return request_vote_response(
+            sender=self.id,
+            term=self.current_term,
+            vote_granted=granted,
+            pre_vote=True,
+        )
+
     def _on_request_vote_response(self, msg: Dict[str, Any]) -> None:
         if msg["term"] > self.current_term:
             self._become_follower(msg["term"])
+            return
+        if msg.get("pre_vote"):
+            if self.state == PRE_CANDIDATE and msg["vote_granted"]:
+                self._votes_received.add(msg["from"])
+                if len(self._votes_received) >= self._majority():
+                    self._start_real_election()
             return
         if self.state != CANDIDATE or msg["term"] != self.current_term:
             return
@@ -282,6 +400,7 @@ class RaftNode:
         # Valid contact from the current leader: stay follower.
         self.state = FOLLOWER
         self.leader_id = msg["leader_id"]
+        self._last_leader_contact = self.clock()
         self._reset_election_deadline()
 
         prev_index = msg["prev_log_index"]
@@ -319,6 +438,24 @@ class RaftNode:
             last_log_index=self.log.last_index(),
         )
 
+    def _maybe_send_timeout_now(self) -> None:
+        target = self._transfer_target
+        if target is None:
+            return
+        if self._match_index.get(target, 0) >= self.log.last_index():
+            self.transport.send(target, timeout_now(sender=self.id, term=self.current_term))
+            self._transfer_target = None
+        else:
+            self._replicate_to(target)
+
+    def _on_timeout_now(self, msg: Dict[str, Any]) -> None:
+        # Sent by the leader we just caught up with, so our term already matches.
+        # Skip PreVote: the transfer is deliberate, and the other voters must
+        # not refuse it because they recently heard from the old leader.
+        if msg["term"] != self.current_term or self.state == LEADER:
+            return
+        self._start_real_election()
+
     def _on_append_entries_response(self, msg: Dict[str, Any]) -> None:
         if msg["term"] > self.current_term:
             self._become_follower(msg["term"])
@@ -330,6 +467,7 @@ class RaftNode:
             self._match_index[peer] = msg["last_log_index"]
             self._next_index[peer] = msg["last_log_index"] + 1
             self._advance_commit_index()
+            self._maybe_send_timeout_now()
         else:
             # Back off one entry and retry; converges because the follower
             # eventually accepts an empty heartbeat prefix.

@@ -50,6 +50,11 @@ def main() -> None:
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--election-timeout", type=float, nargs=2, default=(0.150, 0.300))
     parser.add_argument("--heartbeat", type=float, default=0.050)
+    parser.add_argument(
+        "--no-pre-vote",
+        action="store_true",
+        help="Disable the PreVote phase and elect with plain RequestVote",
+    )
     args = parser.parse_args()
 
     peers = parse_peers(args.peers)
@@ -70,6 +75,7 @@ def main() -> None:
         apply_fn=apply,
         election_timeout=tuple(args.election_timeout),
         heartbeat_interval=args.heartbeat,
+        pre_vote=not args.no_pre_vote,
     )
     transport.start(node.handle_message)
 

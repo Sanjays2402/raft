@@ -9,7 +9,12 @@ from typing import Any, Dict, List
 
 
 def request_vote(
-    sender: str, term: int, candidate_id: str, last_log_index: int, last_log_term: int
+    sender: str,
+    term: int,
+    candidate_id: str,
+    last_log_index: int,
+    last_log_term: int,
+    pre_vote: bool = False,
 ) -> Dict[str, Any]:
     return {
         "type": "request_vote",
@@ -18,17 +23,19 @@ def request_vote(
         "candidate_id": candidate_id,
         "last_log_index": last_log_index,
         "last_log_term": last_log_term,
+        "pre_vote": pre_vote,
     }
 
 
 def request_vote_response(
-    sender: str, term: int, vote_granted: bool
+    sender: str, term: int, vote_granted: bool, pre_vote: bool = False
 ) -> Dict[str, Any]:
     return {
         "type": "request_vote_response",
         "from": sender,
         "term": term,
         "vote_granted": vote_granted,
+        "pre_vote": pre_vote,
     }
 
 
@@ -63,3 +70,11 @@ def append_entries_response(
         "success": success,
         "last_log_index": last_log_index,
     }
+
+
+def timeout_now(sender: str, term: int) -> Dict[str, Any]:
+    """Tells a caught-up follower to start an election immediately.
+
+    Sent by a leader performing a leadership transfer.
+    """
+    return {"type": "timeout_now", "from": sender, "term": term}

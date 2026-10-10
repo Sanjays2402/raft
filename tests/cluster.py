@@ -22,7 +22,7 @@ class VirtualClock:
 class Cluster:
     """A fully deterministic Raft cluster driven by a virtual clock."""
 
-    def __init__(self, node_ids: List[str], seed: int = 42) -> None:
+    def __init__(self, node_ids: List[str], seed: int = 42, **node_kwargs: Any) -> None:
         self.clock = VirtualClock()
         self.transport = LocalTransport()
         self.nodes: Dict[str, RaftNode] = {}
@@ -43,6 +43,7 @@ class Cluster:
                 apply_fn=apply_fn,
                 clock=self.clock,
                 rng=random.Random(seed + i * 1000),
+                **node_kwargs,
             )
             self.transport.register(node_id, node.handle_message)
             self.nodes[node_id] = node

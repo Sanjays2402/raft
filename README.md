@@ -4,6 +4,12 @@ A small, dependency-free implementation of the [Raft consensus algorithm](https:
 
 Implements the Raft core: **leader election** with randomized timeouts, **log replication** with consistency checks, and the **safety** rules that keep committed entries durable across leader changes.
 
+Beyond the core paper, it also includes:
+
+- **PreVote** (on by default): a node must win a pre-election round before bumping its term. A node cut off by a partition therefore cannot inflate its term and depose a healthy leader when it rejoins. Disable with `--no-pre-vote` or `RaftNode(..., pre_vote=False)`.
+- **Leadership transfer**: `node.transfer_leadership(peer)` hands off leadership to a caught-up follower without waiting for a timeout. New submits are rejected with `TransferInProgressError` while a transfer is pending. A transfer that does not complete within one election timeout is abandoned.
+- **Status snapshots**: `node.status()` returns a JSON-serializable dict with role, term, leader, commit and apply indexes, and per-peer replication progress on the leader.
+
 ## Architecture
 
 ```
@@ -85,6 +91,9 @@ The suite drives 3-node clusters on a virtual clock through `LocalTransport`:
 - `test_replication.py` — entries submitted to the leader commit on every node with identical logs; `submit` on a follower raises `NotLeaderError`; a follower with a conflicting uncommitted suffix converges to the leader's log.
 - `test_stepdown.py` — a partitioned leader is replaced at a higher term and steps down to follower when the partition heals; stale-term `RequestVote`s are denied.
 - `test_storage.py` — persistent-state round-trips for both storage backends.
+- `test_pre_vote.py` — a partitioned node keeps its term; a live leader denies pre-votes; elections still work with PreVote disabled.
+- `test_transfer.py` — leadership moves to the target and committed entries survive; submits are blocked during a pending transfer; stalled transfers time out; invalid targets are rejected.
+- `test_status.py` — `status()` is serializable and reports leader replication progress.
 
 ## Design notes
 
