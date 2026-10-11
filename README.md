@@ -1,57 +1,45 @@
 # raft
 
-A small, dependency-free implementation of the [Raft consensus algorithm](https://raft.github.io/) in Python. Standard library only, no third-party packages.
+**Raft consensus in pure Python, no dependencies.** A readable, battle-tested core you can actually learn from: leader election, log replication, and the safety rules that make distributed agreement work.
 
-Implements the Raft core: **leader election** with randomized timeouts, **log replication** with consistency checks, and the **safety** rules that keep committed entries durable across leader changes.
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](raft/)
+[![Tests](https://img.shields.io/badge/tests-22%20passing-brightgreen.svg)](tests/)
 
-Beyond the core paper, it also includes:
+## Why Raft, and why this one
 
-- **PreVote** (on by default): a node must win a pre-election round before bumping its term. A node cut off by a partition therefore cannot inflate its term and depose a healthy leader when it rejoins. Disable with `--no-pre-vote` or `RaftNode(..., pre_vote=False)`.
-- **Leadership transfer**: `node.transfer_leadership(peer)` hands off leadership to a caught-up follower without waiting for a timeout. New submits are rejected with `TransferInProgressError` while a transfer is pending. A transfer that does not complete within one election timeout is abandoned.
-- **Status snapshots**: `node.status()` returns a JSON-serializable dict with role, term, leader, commit and apply indexes, and per-peer replication progress on the leader.
+Consensus is the hard problem behind etcd, Kubernetes, and every database that claims high availability. [Raft](https://raft.github.io/) is the algorithm designed to be understood, and this implementation takes that seriously: the whole state machine lives in one module (`raft/node.py`), reads top to bottom like the paper, and runs with nothing but the standard library.
 
-## Architecture
+Most Raft code out there is either a toy that skips the safety rules or a framework buried in dependencies. This one keeps the actual guarantees, election safety, log consistency, leader completeness, so what you read here maps one-to-one onto real systems. Use it to learn consensus, to prototype a replicated service, or as a reference implementation when debugging your own.
 
-```
-                  +-------------------+
-                  |     RaftNode      |   pure state machine: no threads,
-                  |  tick() / handle_  |   no sockets, driven by the host
-                  |  message() /       |
-                  |  submit()          |
-                  +--------+----------+
-                           |  send(target, msg)
-              +------------+------------+
-              |                         |
-     LocalTransport              TcpTransport
-     (in-process, tests)         (JSON over TCP)
-              |                         |
-         +----+-------------------------+----+
-         |        Storage (term, vote, log)   |
-         |   MemoryStorage | FileStorage     |
-         +-----------------------------------+
-```
+## Features
 
-- `raft/node.py` — the consensus state machine: follower/candidate/leader roles, election timers, `RequestVote` / `AppendEntries` handling, commit advancement, ordered application of committed entries via an `apply_fn` callback.
-- `raft/log.py` — 1-indexed in-memory log of `(term, command)` entries.
-- `raft/storage.py` — persistent-state abstraction (`current_term`, `voted_for`, log). `MemoryStorage` for tests, `FileStorage` with atomic JSON writes for real nodes.
-- `raft/transport.py` — `LocalTransport` (queued in-process delivery with partition simulation) and `TcpTransport` (length-prefixed JSON frames over persistent per-peer connections).
-- `raft/server.py` — runnable node: `python -m raft.server --id n1 --port 5001 --peers n2=127.0.0.1:5002,...`. Persists state to disk and applies committed `{"op": "set", ...}` commands to an in-memory map.
+- **Leader election** with randomized election timeouts; exactly one leader per term
+- **Log replication** with consistency checks, `next_index` backoff, and ordered commit
+- **PreVote** (on by default): a partitioned node can't inflate its term and depose a healthy leader when it rejoins
+- **Leadership transfer**: hand leadership to a caught-up follower without waiting for a timeout
+- **Persistent state**: `current_term`, `voted_for`, and the log survive restarts via atomic file writes
+- **Deterministic testing**: time and randomness are injected, so whole clusters run on a virtual clock
+- **Pluggable transports**: in-process delivery for tests, JSON-over-TCP for real nodes
 
-Time and randomness are injected (`clock`, `rng`), so the whole cluster runs deterministically on a virtual clock in tests.
+## Quickstart: a cluster in 60 seconds
 
-## Quickstart
-
-Three nodes on localhost (one terminal each):
+Clone the repo, then start three nodes (one terminal each):
 
 ```bash
+git clone https://github.com/Sanjays2402/raft.git && cd raft
 python -m raft.server --id n1 --port 5001 --peers n2=127.0.0.1:5002,n3=127.0.0.1:5003
 python -m raft.server --id n2 --port 5002 --peers n1=127.0.0.1:5001,n3=127.0.0.1:5003
 python -m raft.server --id n3 --port 5003 --peers n1=127.0.0.1:5001,n2=127.0.0.1:5002
 ```
 
-Within a few hundred milliseconds one node prints `LEADER`; the others follow it. Kill the leader's process and watch the remaining two elect a replacement.
+Each node prints a per-second status line. Within a few hundred milliseconds one of them will show `state=LEADER <- LEADER`; the others follow it. Each node also runs a tiny key-value store on top of Raft: every committed `{"op": "set", "key": ..., "value": ...}` command is applied to an in-memory map.
 
-Embedding the node programmatically:
+Kill the leader's process and watch the remaining two elect a replacement within an election timeout, with no lost committed writes. Persistent state lives in `./data/<node-id>.json`, so a restarted node rejoins with its term and log intact.
+
+## Embed it in your own code
+
+The state machine is pure: no threads, no sockets. You drive it with `tick()`, `handle_message()`, and `submit()`:
 
 ```python
 from raft import RaftNode, MemoryStorage, LocalTransport
@@ -74,10 +62,39 @@ while time.monotonic() < deadline:
     time.sleep(0.005)
 
 leader = next(n for n in nodes.values() if n.state == "leader")
-leader.submit({"op": "set", "key": "hello", "value": "world"})
+index = leader.submit({"op": "set", "key": "hello", "value": "world"})
+print("committed at index", index)
 ```
 
-Commands must be JSON-serializable; they cross the TCP transport and the file storage as JSON.
+`submit()` on a follower raises `NotLeaderError` (the exception carries the known leader's id). Commands must be JSON-serializable; they cross the TCP transport and the file storage as JSON.
+
+## Architecture
+
+```
+                  +-------------------+
+                  |     RaftNode      |   pure state machine: no threads,
+                  |  tick() / handle_  |   no sockets, driven by the host
+                  |  message() /       |
+                  |  submit()          |
+                  +--------+----------+
+                           |  send(target, msg)
+              +------------+------------+
+              |                         |
+     LocalTransport              TcpTransport
+     (in-process, tests)         (JSON over TCP)
+              |                         |
+         +----+-------------------------+----+
+         |        Storage (term, vote, log)   |
+         |   MemoryStorage | FileStorage     |
+         +-----------------------------------+
+```
+
+- `raft/node.py` — the consensus state machine: follower/candidate/leader roles, election timers, `RequestVote` / `AppendEntries` handling, commit advancement, ordered application of committed entries via an `apply_fn` callback
+- `raft/log.py` — 1-indexed in-memory log of `(term, command)` entries
+- `raft/storage.py` — persistent-state abstraction (`current_term`, `voted_for`, log). `MemoryStorage` for tests, `FileStorage` with atomic JSON writes for real nodes
+- `raft/transport.py` — `LocalTransport` (queued in-process delivery with partition simulation) and `TcpTransport` (length-prefixed JSON frames over persistent per-peer connections)
+- `raft/rpc.py` — message constructors for `RequestVote` (including the PreVote variant), `AppendEntries`, and leadership transfer (`TimeoutNow`)
+- `raft/server.py` — runnable node with a persistent key-value store on top
 
 ## Testing
 
@@ -87,13 +104,13 @@ python -m unittest discover -s tests -v
 
 The suite drives 3-node clusters on a virtual clock through `LocalTransport`:
 
-- `test_election.py` — exactly one leader is elected, leadership is stable, all nodes converge on the leader's term.
-- `test_replication.py` — entries submitted to the leader commit on every node with identical logs; `submit` on a follower raises `NotLeaderError`; a follower with a conflicting uncommitted suffix converges to the leader's log.
-- `test_stepdown.py` — a partitioned leader is replaced at a higher term and steps down to follower when the partition heals; stale-term `RequestVote`s are denied.
-- `test_storage.py` — persistent-state round-trips for both storage backends.
-- `test_pre_vote.py` — a partitioned node keeps its term; a live leader denies pre-votes; elections still work with PreVote disabled.
-- `test_transfer.py` — leadership moves to the target and committed entries survive; submits are blocked during a pending transfer; stalled transfers time out; invalid targets are rejected.
-- `test_status.py` — `status()` is serializable and reports leader replication progress.
+- `test_election.py` — exactly one leader is elected, leadership is stable, all nodes converge on the leader's term
+- `test_replication.py` — entries submitted to the leader commit on every node with identical logs; `submit` on a follower raises `NotLeaderError`; a follower with a conflicting uncommitted suffix converges to the leader's log
+- `test_stepdown.py` — a partitioned leader is replaced at a higher term and steps down to follower when the partition heals; stale-term `RequestVote`s are denied
+- `test_storage.py` — persistent-state round-trips for both storage backends
+- `test_pre_vote.py` — a partitioned node keeps its term; a live leader denies pre-votes; elections still work with PreVote disabled
+- `test_transfer.py` — leadership moves to the target and committed entries survive; submits are blocked during a pending transfer; stalled transfers time out; invalid targets are rejected
+- `test_status.py` — `status()` is serializable and reports leader replication progress
 
 ## Design notes
 
